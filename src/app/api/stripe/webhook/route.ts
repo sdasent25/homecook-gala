@@ -2,9 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
 import { createClient } from "@supabase/supabase-js";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: "2023-10-16",
-});
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
 
 const supabaseAdmin = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -12,68 +10,90 @@ const supabaseAdmin = createClient(
 );
 
 export async function POST(req: NextRequest) {
-  const sig = req.headers.get("stripe-signature");
+  const signature = req.headers.get("stripe-signature");
   const body = await req.text();
+
+  if (!signature) {
+    return NextResponse.json({ error: "Missing signature" }, { status: 400 });
+  }
 
   let event: Stripe.Event;
 
   try {
     event = stripe.webhooks.constructEvent(
       body,
-      sig!,
+      signature,
       process.env.STRIPE_WEBHOOK_SECRET!
     );
   } catch (err) {
+    console.error("Webhook signature verification failed:", err);
     return NextResponse.json({ error: "Invalid signature" }, { status: 400 });
   }
 
   try {
     switch (event.type) {
       // ----------------------------------
-      // PRO CREATOR SUBSCRIPTION
+      // PRO CREATOR SUBSCRIPTION ACTIVE
       // ----------------------------------
       case "invoice.payment_succeeded": {
         const invoice = event.data.object as Stripe.Invoice;
-        const subscriptionId = invoice.subscription as string;
+
+        if (
+          !invoice.subscription ||
+          typeof invoice.subscription !== "string"
+        ) {
+          console.warn("Invoice missing subscription ID");
+          break;
+        }
 
         await supabaseAdmin
           .from("subscriptions")
           .update({ status: "active" })
-          .eq("stripe_subscription_id", subscriptionId);
+          .eq("stripe_subscription_id", invoice.subscription);
 
         break;
       }
 
+      // ----------------------------------
+      // SUBSCRIPTION CANCELED
+      // ----------------------------------
       case "customer.subscription.deleted": {
-        const sub = event.data.object as Stripe.Subscription;
+        const subscription = event.data.object as Stripe.Subscription;
 
         await supabaseAdmin
           .from("subscriptions")
           .update({ status: "canceled" })
-          .eq("stripe_subscription_id", sub.id);
+          .eq("stripe_subscription_id", subscription.id);
 
         break;
       }
 
       // ----------------------------------
-      // PLACEMENTS
+      // PLACEMENT PURCHASE
       // ----------------------------------
       case "checkout.session.completed": {
         const session = event.data.object as Stripe.Checkout.Session;
 
-        if (!session.metadata?.placement_type) break;
+        if (
+          !session.metadata ||
+          !session.metadata.creator_id ||
+          !session.metadata.placement_type ||
+          !session.metadata.duration_days
+        ) {
+          break;
+        }
 
-        const days = Number(session.metadata.duration_days);
-        const start = new Date();
-        const end = new Date(start);
-        end.setDate(end.getDate() + days);
+        const durationDays = Number(session.metadata.duration_days);
+        const startDate = new Date();
+        const endDate = new Date(startDate);
+        endDate.setDate(endDate.getDate() + durationDays);
 
         await supabaseAdmin.from("placements").insert({
           creator_id: session.metadata.creator_id,
           type: session.metadata.placement_type,
-          category: session.metadata.category || null,
-          start_date: start.toISOString(),
-          end_date: end.toISOString(),
+          category: session.metadata.category ?? null,
+          start_date: startDate.toISOString(),
+          end_date: endDate.toISOString(),
           stripe_checkout_session_id: session.id,
         });
 
@@ -81,10 +101,12 @@ export async function POST(req: NextRequest) {
       }
 
       // ----------------------------------
-      // REFUNDS
+      // REFUND → DEACTIVATE PLACEMENT
       // ----------------------------------
       case "charge.refunded": {
         const charge = event.data.object as Stripe.Charge;
+
+        if (!charge.payment_intent) break;
 
         await supabaseAdmin
           .from("placements")
@@ -93,10 +115,18 @@ export async function POST(req: NextRequest) {
 
         break;
       }
+
+      default:
+        // Ignore unhandled events
+        break;
     }
 
     return NextResponse.json({ received: true });
   } catch (err) {
-    return NextResponse.json({ error: "Webhook handler failed" }, { status: 500 });
+    console.error("Webhook handler error:", err);
+    return NextResponse.json(
+      { error: "Webhook processing failed" },
+      { status: 500 }
+    );
   }
 }
