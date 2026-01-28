@@ -1,33 +1,51 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: "2023-10-16",
-});
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 
 export async function POST(req: NextRequest) {
-  const body = await req.json();
+  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
 
-  const {
-    priceId,
-    successUrl,
-    cancelUrl,
-    metadata, // { placement_type, duration_days, creator_id, category? }
-    mode, // "payment" | "subscription"
-  } = body;
+  let body: {
+    priceId: string;
+    mode: "payment" | "subscription";
+    successUrl: string;
+    cancelUrl: string;
+    metadata?: Record<string, string>;
+  };
 
-  if (!priceId || !successUrl || !cancelUrl || !mode) {
-    return NextResponse.json({ error: "Missing params" }, { status: 400 });
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
   }
 
-  const session = await stripe.checkout.sessions.create({
-    mode,
-    line_items: [{ price: priceId, quantity: 1 }],
-    success_url: successUrl,
-    cancel_url: cancelUrl,
-    allow_promotion_codes: true,
-    metadata,
-  });
+  const { priceId, mode, successUrl, cancelUrl, metadata } = body;
 
-  return NextResponse.json({ url: session.url });
+  if (!priceId || !mode || !successUrl || !cancelUrl) {
+    return NextResponse.json(
+      { error: "Missing required parameters" },
+      { status: 400 }
+    );
+  }
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode,
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      allow_promotion_codes: true,
+      metadata: metadata ?? {},
+    });
+
+    return NextResponse.json({ url: session.url });
+  } catch (err) {
+    console.error("Stripe checkout error:", err);
+    return NextResponse.json(
+      { error: "Checkout session failed" },
+      { status: 500 }
+    );
+  }
 }
